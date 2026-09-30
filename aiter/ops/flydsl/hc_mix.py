@@ -69,14 +69,14 @@ def _load(tensor, offset, width, dtype):
         kind = fx.rocdl.BufferCopy32b()
     else:
         kind = fx.rocdl.BufferCopy16b()
-    view = fx.make_view(fx.get_iter(tensor) + offset, fx.make_layout(width, 1))
+    view = fx.make_view(fx.get_iter(tensor) + fx.Int32(offset), fx.make_layout(width, 1))
     frag = fx.make_rmem_tensor(width, dtype)
     fx.copy(fx.make_copy_atom(kind, dtype), view, frag)
     return fx.Vector(frag.load())
 
 
 def _store(tensor, offset, value, dtype):
-    view = fx.make_view(fx.get_iter(tensor) + offset, fx.make_layout(1, 1))
+    view = fx.make_view(fx.get_iter(tensor) + fx.Int32(offset), fx.make_layout(1, 1))
     atom = fx.make_copy_atom(
         fx.rocdl.BufferCopy32b() if dtype == fx.Float32 else fx.rocdl.BufferCopy16b(),
         dtype,
