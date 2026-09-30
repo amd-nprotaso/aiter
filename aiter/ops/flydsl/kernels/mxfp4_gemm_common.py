@@ -144,7 +144,7 @@ def global_typed_ptr(arg, elem_ty, align=4, *, byte_offset=None):
     if byte_offset is not None:
         byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global, align)
         base = fx.inttoptr(byte_ptr_ty, fx.Int64(arg))
-        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, fx.Int64(byte_offset)))
     return fx.inttoptr(ptr_ty, fx.Int64(arg))
 
 
@@ -175,7 +175,7 @@ def lds_typed_ptr(base_i32, elem_ty, align=4, *, byte_offset=None):
     if byte_offset is not None:
         byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared, align)
         base = fx.inttoptr(byte_ptr_ty, fx.Int32(base_i32))
-        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, fx.Int32(byte_offset)))
     return fx.inttoptr(ptr_ty, fx.Int32(base_i32))
 
 

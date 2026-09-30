@@ -1072,38 +1072,50 @@ def flydsl_gdr_mtp_sglang(
     )
 
 
-_GDN_VARLEN_VITER4_MIN_DRAFT = 4
-_GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
-_GDN_VARLEN_VITER2_BLOCKS_PER_CU = 12.0
+# (KSPLIT, VITER) per draft length, as (rows per CU up to, KSPLIT, VITER) where a
+# row is one (sequence, v-head) pair. Measured on gfx950 with 256-lane blocks
+# for draft lengths 1, 2, 4 and 8; a length in between takes the next one up.
+# The winner is a function of rows per CU and draft length alone -- the same
+# coverage picks the same tile whether it comes from heads or from sequences.
+# A short grid wants the thinnest K slice (KSPLIT=16) to make blocks; past
+# about one row per CU the tile widens, and how far pays depends on how many
+# snapshots each block has to stream out.
+_GDN_VARLEN_GEOMETRY = {
+    1: ((0.25, 16, 1), (1, 16, 2), (2, 8, 4), (float("inf"), 8, 1)),
+    2: ((0.25, 16, 1), (1, 16, 2), (2, 8, 4), (float("inf"), 16, 2)),
+    4: ((0.25, 16, 1), (1, 8, 2), (4, 8, 4), (float("inf"), 8, 2)),
+    8: ((0.25, 16, 1), (1, 8, 2), (2, 8, 4), (float("inf"), 16, 4)),
+}
+# Streaming the snapshots past the cache pays at both ends: on a short grid
+# nothing else competes for it, and once the snapshots outgrow it (snapshot rows
+# per CU = rows per CU * draft length) caching them only evicts the state. In
+# between, the commit that reads them back soon after still finds them cached.
+_GDN_VARLEN_NT_MAX_ROWS_PER_CU = 0.5
+_GDN_VARLEN_NT_MAX_SNAPSHOT_ROWS_PER_CU = 2
+_GDN_VARLEN_NT_MIN_SNAPSHOT_ROWS_PER_CU = 32
 
 
-def _gdn_varlen_viter(n, tokens_per_seq, num_v_heads, head_v_dim, ksplit, block):
-    """Widest v-iteration this launch's grid can pay for.
+def _gdn_varlen_geometry(
+    n, tokens_per_seq, num_v_heads, head_v_dim, block, cache_states
+):
+    """(KSPLIT, VITER, non-temporal snapshots) for this launch.
 
-    A VITER that does not divide the head width is skipped rather than rounded,
+    A VITER that does not divide the head width is halved rather than rounded,
     since the kernel would refuse it.
     """
-    vlanes = block // ksplit
-    num_sms = get_num_sms()
     draft = max(1, tokens_per_seq)
-
-    def blocks(viter):
-        vtile = vlanes * viter
-        if head_v_dim % vtile:
-            return None
-        return n * num_v_heads * (head_v_dim // vtile)
-
-    wide = blocks(4)
-    if (
-        draft >= _GDN_VARLEN_VITER4_MIN_DRAFT
-        and wide is not None
-        and wide >= _GDN_VARLEN_VITER4_BLOCKS_PER_CU * num_sms
-    ):
-        return 4
-    mid = blocks(2)
-    if mid is not None and mid >= (_GDN_VARLEN_VITER2_BLOCKS_PER_CU / draft) * num_sms:
-        return 2
-    return 1
+    rows_per_cu = n * num_v_heads / get_num_sms()
+    ladder = _GDN_VARLEN_GEOMETRY[min(k for k in (1, 2, 4, 8) if k >= min(draft, 8))]
+    ksplit, viter = next((ks, vi) for lim, ks, vi in ladder if rows_per_cu <= lim)
+    while viter > 1 and head_v_dim % (block // ksplit * viter):
+        viter //= 2
+    snapshot_rows = rows_per_cu * draft
+    nontemporal = cache_states and (
+        rows_per_cu <= _GDN_VARLEN_NT_MAX_ROWS_PER_CU
+        or snapshot_rows <= _GDN_VARLEN_NT_MAX_SNAPSHOT_ROWS_PER_CU
+        or snapshot_rows >= _GDN_VARLEN_NT_MIN_SNAPSHOT_ROWS_PER_CU
+    )
+    return ksplit, viter, nontemporal
 
 
 def flydsl_gdn_decode_varlen(
@@ -1124,9 +1136,10 @@ def flydsl_gdn_decode_varlen(
     disable_state_update: bool = False,
     intermediate_states: torch.Tensor | None = None,
     intermediate_state_indices: torch.Tensor | None = None,
-    ksplit: int = 8,
+    ksplit: int | None = None,
     block: int = 256,
     viter: int | None = None,
+    nontemporal_cache: bool | None = None,
 ) -> torch.Tensor:
     """Gated Delta Net decode recurrence over a packed (varlen) batch.
 
@@ -1135,6 +1148,9 @@ def flydsl_gdn_decode_varlen(
     with ``cu_seqlens``, optional per-draft-step state snapshots, and an optional
     suppressed final write-back (EAGLE target-verify commits the accepted prefix
     itself).
+
+    ``ksplit``, ``viter`` and ``nontemporal_cache`` (streaming snapshot stores)
+    are picked per launch by :func:`_gdn_varlen_geometry` when left as None.
 
     Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
     """
@@ -1189,6 +1205,15 @@ def flydsl_gdn_decode_varlen(
 
     out = q.new_empty(1, T, HV, V)
 
+    auto_ksplit, auto_viter, auto_nt = _gdn_varlen_geometry(
+        n, tokens_per_seq, HV, V, block, cache_states
+    )
+    ksplit = auto_ksplit if ksplit is None else int(ksplit)
+    viter = auto_viter if viter is None else int(viter)
+    nontemporal_cache = cache_states and (
+        auto_nt if nontemporal_cache is None else bool(nontemporal_cache)
+    )
+
     with CompilationContext.compile_hints({"fastmath": "fast"}):
         launch = create_gdn_decode_verify_kernel(
             HV,
@@ -1212,11 +1237,8 @@ def flydsl_gdn_decode_varlen(
             str(b.dtype),
             ksplit,
             block,
-            (
-                _gdn_varlen_viter(n, tokens_per_seq, HV, V, ksplit, block)
-                if viter is None
-                else int(viter)
-            ),
+            viter,
+            nontemporal_cache,
         )
         launch(
             q,

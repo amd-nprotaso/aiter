@@ -30,12 +30,16 @@ def _load_vec(buf, offset, width: fx.Constexpr[int], dtype: fx.Constexpr):
 
 
 @flyc.jit
-def _store_vec(buf, offset, value, dtype: fx.Constexpr):
+def _store_vec(
+    buf, offset, value, dtype: fx.Constexpr, cache_modifier: fx.Constexpr[int] = 0
+):
     reg = fx.make_rmem_tensor(value.numel, dtype)
     reg.store(value)
     view = fx.make_view(fx.get_iter(buf) + offset, fx.make_layout(value.numel, 1))
     fx.copy_atom_call(
-        fx.make_copy_atom(fx.rocdl.BufferCopy(value.numel * dtype.width), dtype),
+        fx.make_copy_atom(
+            fx.rocdl.BufferCopy(value.numel * dtype.width, cache_modifier), dtype
+        ),
         reg,
         view,
     )
@@ -65,6 +69,7 @@ def create_gdn_decode_verify_kernel(
     KSPLIT: int = 8,
     BLOCK: int = 256,
     VITER: int = 1,
+    nontemporal_cache: bool = False,
 ):
     HV, Hg, V, TSTATIC = num_v_heads, num_k_heads, head_v_dim, tokens_per_seq
 
@@ -72,6 +77,12 @@ def create_gdn_decode_verify_kernel(
     VTILE = VLANES * VITER
     KLOCAL = KDIM // KSPLIT
     NHALF = KLOCAL // HALF
+    # Lane kpart owns the HALF-wide K chunks kpart*HALF + j*KSTRIDE, so each
+    # 16-byte access is contiguous across the wave rather than every other chunk.
+    KSTRIDE = KSPLIT * HALF
+    # The snapshots are not read back by this kernel; streaming them past the
+    # cache frees it for the state and inputs once the batch outgrows it.
+    CACHE_CM = 2 if nontemporal_cache else 0
     if KLOCAL % HALF or VLANES * KSPLIT != BLOCK or V % VTILE or VITER < 1:
         raise ValueError(
             f"bad geometry: KSPLIT={KSPLIT} BLOCK={BLOCK} VITER={VITER} V={V} -> "
@@ -123,7 +134,7 @@ def create_gdn_decode_verify_kernel(
 
         kpart = tid % KSPLIT
         vcol = vb + tid // KSPLIT
-        kbase = kpart * KLOCAL
+        kbase = kpart * HALF
         ih = hv // group
 
         bos = fx.Int64(cu[seq])
@@ -164,25 +175,59 @@ def create_gdn_decode_verify_kernel(
         h = [fx.Vector.filled(HALF, 0.0, fx.Float32) for _ in range(VITER * NHALF)]
         if slot >= 0:
             h = [
-                _load_vec(ss, sbase + i * VSTEP + j * HALF, HALF, fx.BFloat16).to(
+                _load_vec(ss, sbase + i * VSTEP + j * KSTRIDE, HALF, fx.BFloat16).to(
                     fx.Float32
                 )
                 for i in range(VITER)
                 for j in range(NHALF)
             ]
 
+        # Issue every token's inputs up front: inside the recurrence the loads
+        # would queue behind the previous token's snapshot stores, paying one
+        # memory round trip per draft token.
+        k_all = [
+            _load_vec(
+                kb,
+                (bos + t) * k_token_stride + ih * KDIM + kbase + j * KSTRIDE,
+                HALF,
+                fx.BFloat16,
+            )
+            for t in range(TSTATIC)
+            for j in range(NHALF)
+        ]
+        q_all = [
+            _load_vec(
+                qb,
+                (bos + t) * q_token_stride + ih * KDIM + kbase + j * KSTRIDE,
+                HALF,
+                fx.BFloat16,
+            )
+            for t in range(TSTATIC)
+            for j in range(NHALF)
+        ]
+        a_all = [
+            _load_vec(ab, (bos + t) * a_token_stride + hv, 1, A_DT)[0]
+            for t in range(TSTATIC)
+        ]
+        b_all = [
+            _load_vec(bb, (bos + t) * b_token_stride + hv, 1, B_DT)[0]
+            for t in range(TSTATIC)
+        ]
+        v_all = [
+            _load_vec(
+                vbuf,
+                (bos + t) * v_token_stride + hv * V + vcol + i * VLANES,
+                1,
+                fx.BFloat16,
+            )[0]
+            for t in range(TSTATIC)
+            for i in range(VITER)
+        ]
+
         for t in range_constexpr(TSTATIC):
             tok = bos + t
-            koff = tok * k_token_stride + ih * KDIM + kbase
-            qoff = tok * q_token_stride + ih * KDIM + kbase
-            kvec = [
-                _load_vec(kb, koff + j * HALF, HALF, fx.BFloat16).to(fx.Float32)
-                for j in range(NHALF)
-            ]
-            qvec = [
-                _load_vec(qb, qoff + j * HALF, HALF, fx.BFloat16).to(fx.Float32)
-                for j in range(NHALF)
-            ]
+            kvec = [k_all[t * NHALF + j].to(fx.Float32) for j in range(NHALF)]
+            qvec = [q_all[t * NHALF + j].to(fx.Float32) for j in range(NHALF)]
 
             sk_local = functools.reduce(lambda p, c: p + c, [x * x for x in kvec])
             sq_local = functools.reduce(lambda p, c: p + c, [x * x for x in qvec])
@@ -193,18 +238,10 @@ def create_gdn_decode_verify_kernel(
             kvec = [x * rk for x in kvec]
             qvec = [x * rq for x in qvec]
 
-            av = fx.Float32(
-                _load_vec(ab, tok * a_token_stride + hv, 1, A_DT)[0].to(fx.Float32)
-            )
-            bv_in = fx.Float32(
-                _load_vec(bb, tok * b_token_stride + hv, 1, B_DT)[0].to(fx.Float32)
-            )
-            voff = tok * v_token_stride + hv * V + vcol
+            av = fx.Float32(a_all[t].to(fx.Float32))
+            bv_in = fx.Float32(b_all[t].to(fx.Float32))
             vval = [
-                fx.Float32(
-                    _load_vec(vbuf, voff + i * VLANES, 1, fx.BFloat16)[0].to(fx.Float32)
-                )
-                for i in range(VITER)
+                fx.Float32(v_all[t * VITER + i].to(fx.Float32)) for i in range(VITER)
             ]
 
             x = av + dtb
@@ -263,9 +300,10 @@ def create_gdn_decode_verify_kernel(
                         for j in range_constexpr(NHALF):
                             _store_vec(
                                 cb,
-                                t * (HV * V * KDIM) + sbase + i * VSTEP + j * HALF,
+                                t * (HV * V * KDIM) + sbase + i * VSTEP + j * KSTRIDE,
                                 h[i * NHALF + j].to(fx.BFloat16),
                                 fx.BFloat16,
+                                CACHE_CM,
                             )
 
         # Keep compile-time and runtime branches separate for FlyDSL.
@@ -275,7 +313,7 @@ def create_gdn_decode_verify_kernel(
                     for j in range_constexpr(NHALF):
                         _store_vec(
                             ss,
-                            sbase + i * VSTEP + j * HALF,
+                            sbase + i * VSTEP + j * KSTRIDE,
                             h[i * NHALF + j].to(fx.BFloat16),
                             fx.BFloat16,
                         )
