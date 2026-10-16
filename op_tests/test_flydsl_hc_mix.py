@@ -29,13 +29,34 @@ def reference(x, d, u):
     )
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 7, 15, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 7, 15, 16, 17, 32, 33, 64, 100, 128])
 @pytest.mark.parametrize("k,r", [(2048, 32), (8192, 128), (10240, 320)])
 def test_correctness(m, k, r):
     torch.manual_seed(11)
     x, d, u = inputs(m, k, r)
     dp, up = pack_hc_weights(d, u)
     y = hc_mix(x, dp, up)
+    torch.testing.assert_close(y, reference(x, d, u), atol=0.004, rtol=0.01)
+
+
+@pytest.mark.parametrize("m", [5, 128])
+def test_unstaged_operand(monkeypatch, m):
+    # Tiles too large for LDS make the up projection read T from global memory.
+    import aiter.ops.flydsl.hc_mix as mod
+
+    monkeypatch.setattr(mod, "_LDS_BYTES", 0)
+    torch.manual_seed(11)
+    x, d, u = inputs(m)
+    y = hc_mix(x, *pack_hc_weights(d, u))
+    torch.testing.assert_close(y, reference(x, d, u), atol=0.004, rtol=0.01)
+
+
+@pytest.mark.parametrize("m", [1, 7, 16])
+@pytest.mark.parametrize("k,r", [(2048, 32), (10240, 320)])
+def test_fused_reduce(m, k, r):
+    torch.manual_seed(11)
+    x, d, u = inputs(m, k, r)
+    y = hc_mix(x, *pack_hc_weights(d, u), fuse_reduce=True)
     torch.testing.assert_close(y, reference(x, d, u), atol=0.004, rtol=0.01)
 
 
@@ -48,9 +69,10 @@ def test_gate_range(scale):
     )
 
 
-def test_graph_and_stream_isolation():
+@pytest.mark.parametrize("m", [4, 64])
+def test_graph_and_stream_isolation(m):
     # Different concurrent calls must never share split-K scratch or counters.
-    data = [inputs(4), inputs(4)]
+    data = [inputs(m), inputs(m)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs, outputs, packed = [], [], []
     for (x, d, u), stream in zip(data, streams):
@@ -78,7 +100,7 @@ def test_graph_and_stream_isolation():
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("m", [0, 17])
+@pytest.mark.parametrize("m", [0, 129])
 def test_reject_rows(m):
     x, d, u = inputs(m)
     with pytest.raises(ValueError):
@@ -95,5 +117,7 @@ def test_reject_invalid_arguments():
         hc_mix(x.half(), *packed)
     with pytest.raises(ValueError):
         hc_mix(x, packed[0], packed[1][:-1])
+    with pytest.raises(ValueError):
+        hc_mix(torch.cat([x] * 17), *packed, fuse_reduce=True)
     with pytest.raises(ValueError):
         pack_hc_weights(d, u, hc=5)
