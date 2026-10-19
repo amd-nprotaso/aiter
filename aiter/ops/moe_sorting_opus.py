@@ -55,7 +55,14 @@ def mxfp4_moe_sort_quant_fwd(
 ) -> None:
     """Fused route sort + compact MXFP4 activation quantization.
 
-    gfx950 only, ``model_dim=4096``, ``block_m=32``, ``M`` in ``[1, 128]``.
-    ``(num_experts, topk)`` must be one of ``(512, 10)`` or ``(513, 11)``
-    -- the expert histogram is a kernel template parameter.
+    gfx950 only, ``block_m=32``, ``M`` in ``[1, 128]``, BF16 contiguous
+    ``hidden_states`` of shape ``[M, H]``. ``(num_experts, topk, H)`` must be
+    one of ``(512, 10, 4096)``, ``(513, 11, 4096)`` or ``(513, 11, 2560)`` --
+    the expert histogram and the hidden size are kernel template parameters.
+
+    Outputs: ``activation_quant`` is ``[M, H // 2]`` packed fp4,
+    ``activation_scale_token`` is ``[M, H // 32]`` compact per-token e8m0
+    (expand with ``mxfp4_moe_sort_fwd(..., cols=H)`` for the sorted-row
+    layout), and ``moe_buf`` is either empty or at least ``M * H`` BF16/FP16
+    elements, whose first ``M * H`` elements are zeroed.
     """

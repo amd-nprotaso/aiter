@@ -97,18 +97,20 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 
 namespace aiter::mxfp4_moe {
 
-constexpr int kHiddenSize    = 4096;
 constexpr int kBlockM        = 32;
 constexpr int kThreads       = 1024;
 constexpr int kSortQuantCtas = 16;
-constexpr int kScaleCols     = kHiddenSize / 32;
+constexpr int kMxGroupSize   = 32;
 
-// Routed-MoE shapes the sort kernel is instantiated for. NumExperts and TopK
-// are template parameters (the expert histogram lives in LDS), so widening the
-// support surface means adding a row here.
+// (NumExperts, TopK, HiddenSize) shapes the kernel is instantiated for. All
+// three are template parameters (the expert histogram lives in LDS and the
+// hidden size fixes the per-token group count), so widening the support
+// surface means adding a row here and to _FUSED_DECODE_SORT_QUANT_ROUTES in
+// aiter/fused_moe.py.
 #define AITER_MXFP4_SORT_QUANT_ROUTES(_) \
-    _(512, 10)                           \
-    _(513, 11)
+    _(512, 10, 4096)                     \
+    _(513, 11, 4096)                     \
+    _(513, 11, 2560)
 
 __device__ __forceinline__ int pack_token_topk_id(int token_id, int topk_id)
 {
@@ -136,13 +138,16 @@ __device__ __forceinline__ int dpp_inclusive_scan_wave(int value)
     return value + tmp;
 }
 
-template <int NumCtas>
+template <int NumCtas, int HiddenSize>
 __device__ __forceinline__ void zero_moe_output(void* output, int tokens)
 {
+    // A BF16/FP16 row must split into whole int4 stores.
+    static_assert((HiddenSize * 2) % sizeof(int4) == 0,
+                  "moe_buf rows must be whole int4 vectors");
     if(output == nullptr)
         return;
 
-    constexpr long long row_bytes = static_cast<long long>(kHiddenSize) * 2;
+    constexpr long long row_bytes = static_cast<long long>(HiddenSize) * 2;
     const long long total_vecs = (static_cast<long long>(tokens) * row_bytes) / sizeof(int4);
     const long long global_thread =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -255,7 +260,7 @@ __device__ __forceinline__ void build_sorted_metadata(
     }
 }
 
-template <int QuantCtas>
+template <int QuantCtas, int HiddenSize>
 __device__ __forceinline__ void quantize_activations_compact(
     const hip_bfloat16* hidden_states,
     uint8_t* activation_quant,
@@ -263,7 +268,11 @@ __device__ __forceinline__ void quantize_activations_compact(
     int tokens)
 {
     using bf16x2_t = __bf16 __attribute__((ext_vector_type(2)));
-    constexpr int groups_per_token = kHiddenSize / 32;
+    // Groups are numbered flat across [tokens, HiddenSize / 32], so the
+    // payload and scale offsets below are row-major for any whole-group H.
+    static_assert(HiddenSize % kMxGroupSize == 0,
+                  "hidden size must be a whole number of MX groups");
+    constexpr int groups_per_token = HiddenSize / kMxGroupSize;
     constexpr int groups_per_wave = 16;
     constexpr int groups_per_cta = (kThreads / 64) * groups_per_wave;
 
@@ -335,7 +344,7 @@ __device__ __forceinline__ void quantize_activations_compact(
     }
 }
 
-template <int NumExperts, int TopK>
+template <int NumExperts, int TopK, int HiddenSize>
 __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     const hip_bfloat16* hidden_states,
     const int32_t* topk_ids,
@@ -349,7 +358,7 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     uint8_t* activation_scale_token,
     int tokens)
 {
-    zero_moe_output<kSortQuantCtas>(moe_buf, tokens);
+    zero_moe_output<kSortQuantCtas, HiddenSize>(moe_buf, tokens);
     if(blockIdx.x == 0)
     {
         build_sorted_metadata<NumExperts, TopK>(
@@ -363,7 +372,7 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     }
     else
     {
-        quantize_activations_compact<kSortQuantCtas - 1>(
+        quantize_activations_compact<kSortQuantCtas - 1, HiddenSize>(
             hidden_states, activation_quant, activation_scale_token, tokens);
     }
 }
@@ -448,19 +457,19 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                 ": expected int32 sorted_token_ids, fp32 sorted_weights, int32 "
                 "sorted_expert_ids, and int32 num_valid_ids");
     const int topk = topk_ids.dim() == 2 ? static_cast<int>(topk_ids.size(1)) : 0;
+    const int hidden = hidden_states.dim() == 2 ? static_cast<int>(hidden_states.size(1)) : 0;
 
-#define AITER_MXFP4_SORT_QUANT_MATCH(NUM_EXPERTS, TOPK) \
-    || (num_experts == (NUM_EXPERTS) && topk == (TOPK))
+#define AITER_MXFP4_SORT_QUANT_MATCH(NUM_EXPERTS, TOPK, HIDDEN) \
+    || (num_experts == (NUM_EXPERTS) && topk == (TOPK) && hidden == (HIDDEN))
     const bool route_supported =
         false AITER_MXFP4_SORT_QUANT_ROUTES(AITER_MXFP4_SORT_QUANT_MATCH);
 #undef AITER_MXFP4_SORT_QUANT_MATCH
 
-    AITER_CHECK(hidden_states.dim() == 2 && hidden_states.size(1) == kHiddenSize &&
-                    topk_ids.dim() == 2 && topk_ids.size(0) == hidden_states.size(0) &&
-                    route_supported,
+    AITER_CHECK(hidden_states.dim() == 2 && topk_ids.dim() == 2 &&
+                    topk_ids.size(0) == hidden_states.size(0) && route_supported,
                 __func__,
-                ": only H=4096 with (num_experts, topk) in "
-                "{(512,10), (513,11)} is supported");
+                ": only (num_experts, topk, H) in "
+                "{(512,10,4096), (513,11,4096), (513,11,2560)} is supported");
     AITER_CHECK(hidden_states.is_contiguous() && topk_ids.is_contiguous() &&
                     topk_weights.is_contiguous() && sorted_token_ids.is_contiguous() &&
                     sorted_weights.is_contiguous() && sorted_expert_ids.is_contiguous() &&
@@ -492,17 +501,16 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
     AITER_CHECK(topk_weights.numel() == topk_ids.numel() &&
                     activation_quant.numel() == hidden_states.numel() / 2 &&
                     activation_scale_token.numel() ==
-                        hidden_states.size(0) * kScaleCols &&
+                        hidden_states.size(0) * (hidden / kMxGroupSize) &&
                     num_valid_ids.numel() >= 2,
                 __func__,
                 ": incompatible fused sort/quant tensor sizes");
     AITER_CHECK(moe_buf.numel() == 0 ||
                     ((moe_buf.dtype() == AITER_DTYPE_bf16 ||
                       moe_buf.dtype() == AITER_DTYPE_fp16) &&
-                     moe_buf.numel() >=
-                         static_cast<int64_t>(tokens) * kHiddenSize),
+                     moe_buf.numel() >= static_cast<int64_t>(tokens) * hidden),
                 __func__,
-                ": moe_buf must be empty or contain at least M*4096 BF16/FP16 elements");
+                ": moe_buf must be empty or contain at least M*H BF16/FP16 elements");
 
     AITER_CHECK(sorted_token_ids.numel() >= required_sorted &&
                     sorted_weights.numel() >= required_sorted &&
@@ -525,10 +533,10 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
     uint8_t* activation_quant_ptr = static_cast<uint8_t*>(activation_quant.data_ptr());
     uint8_t* activation_scale_token_ptr =
         static_cast<uint8_t*>(activation_scale_token.data_ptr());
-#define AITER_MXFP4_SORT_QUANT_LAUNCH(NUM_EXPERTS, TOPK)                            \
-    if(num_experts == (NUM_EXPERTS) && topk == (TOPK))                              \
+#define AITER_MXFP4_SORT_QUANT_LAUNCH(NUM_EXPERTS, TOPK, HIDDEN)                    \
+    if(num_experts == (NUM_EXPERTS) && topk == (TOPK) && hidden == (HIDDEN))        \
     {                                                                               \
-        aiter::mxfp4_moe::moe_sort_quant_kernel<(NUM_EXPERTS), (TOPK)>              \
+        aiter::mxfp4_moe::moe_sort_quant_kernel<(NUM_EXPERTS), (TOPK), (HIDDEN)>    \
             <<<dim3(kSortQuantCtas), dim3(kThreads), 0, stream>>>(                  \
                 hidden_ptr,                                                         \
                 topk_ids_ptr,                                                       \

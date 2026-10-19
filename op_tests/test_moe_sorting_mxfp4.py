@@ -35,6 +35,7 @@ from aiter.ops.quant import (
     fused_dynamic_mxfp4_quant_moe_sort as hip_fused_mxfp4_quant_moe_sort,
 )
 from aiter.ops.quant import (
+    mxfp4_moe_sort_fwd,
     per_1x32_f4_quant_hip,
     per_1x32_f8_scale_f8_quant,
     per_1x32_mx_quant_hip,
@@ -485,18 +486,23 @@ aiter.logger.info("moe_%s_quant_sort_stage2 summary (markdown):\n%s", _label, df
 #
 # `mxfp4_moe_sort_quant_fwd` fuses Opus route sorting, BF16->MXFP4 activation
 # quant (per-token E8M0 scales), and routed-output zeroing into one launch.
-# It is instantiated only for model_dim=4096, block_m=32, M in [1, 128], and
-# the two routes (num_experts, topk) in {(512, 10), (513, 11)}, and is selected
-# automatically by the fused_moe gate -- there is no enable switch.
+# It is instantiated only for block_m=32, M in [1, 128], and the shapes
+# (num_experts, topk, model_dim) in {(512, 10, 4096), (513, 11, 4096),
+# (513, 11, 2560)}, and is selected automatically by the fused_moe gate --
+# there is no enable switch.
 # ---------------------------------------------------------------------------
-_FUSED_HIDDEN = 4096
 # The last expert of (513, 11) is a fused shared expert every token routes to;
 # (512, 10) dispatches its shared expert separately.
 _FUSED_SHARED_ROUTE = (513, 11)
-_FUSED_ROUTES = ((513, 11), (512, 10))
+# (num_experts, topk, model_dim): Qwen3.5 (H=4096) and Qwen3.8-Flash-Next
+# (H=2560, shared expert fused as expert 512).
+_FUSED_ROUTES = ((513, 11, 4096), (512, 10, 4096), (513, 11, 2560))
 # Non-power-of-2 counts included on purpose: the contract is M in [1, 128], not
 # a whitelist, and partial 32-row tail blocks take a different path.
 _FUSED_TOKEN_COUNTS = [1, 2, 3, 4, 8, 16, 17, 32, 64, 100, 127, 128]
+# Decode shapes checked byte-for-byte against the generic sort + quant path:
+# M=16 / M=64 are the MTP-draft / target-verify batches, the rest are edges.
+_FUSED_EXACT_TOKEN_COUNTS = [1, 16, 17, 64, 128]
 # Keyword gate inputs shared by the contract checks below.
 _FUSED_GATE_KWARGS = {
     "block_m": 32,
@@ -530,9 +536,9 @@ def _running_on_gfx950():
         return False
 
 
-def _make_fused_inputs(tokens, experts, topk):
+def _make_fused_inputs(tokens, experts, topk, model_dim):
     torch.manual_seed(1000 + tokens)
-    hidden = torch.randn((tokens, _FUSED_HIDDEN), dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
     if (experts, topk) != _FUSED_SHARED_ROUTE:
         topk_ids = torch.stack(
             [
@@ -585,8 +591,8 @@ def _canonical_entries(sorted_ids, sorted_weights, sorted_experts, num_valid_ids
     return sorted(entries)
 
 
-def _run_fused(hidden, topk_ids, topk_weights, experts, bm):
-    tokens = hidden.shape[0]
+def _run_fused(hidden, topk_ids, topk_weights, experts, bm, moe_buf=None):
+    tokens, model_dim = hidden.shape
     route_count = topk_ids.numel()
     active_experts = min(experts, route_count)
     max_sorted = (route_count + active_experts * (bm - 1) + bm - 1) // bm * bm
@@ -596,12 +602,13 @@ def _run_fused(hidden, topk_ids, topk_weights, experts, bm):
         (max_sorted + bm - 1) // bm, dtype=torch.int32, device="cuda"
     )
     num_valid_ids = torch.empty(2, dtype=torch.int32, device="cuda")
-    moe_buf = torch.empty((tokens, _FUSED_HIDDEN), dtype=torch.bfloat16, device="cuda")
+    if moe_buf is None:
+        moe_buf = torch.empty((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
     activation_quant = torch.empty(
-        (tokens, _FUSED_HIDDEN // 2), dtype=dtypes.fp4x2, device="cuda"
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device="cuda"
     )
     activation_scale_token = torch.empty(
-        (tokens, _FUSED_HIDDEN // 32), dtype=dtypes.fp8_e8m0, device="cuda"
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device="cuda"
     )
     aiter.mxfp4_moe_sort_quant_fwd(
         hidden,
@@ -628,16 +635,16 @@ def _run_fused(hidden, topk_ids, topk_weights, experts, bm):
 
 
 @benchmark()
-def test_mxfp4_fused_sort_quant(dtype, token_num, E, topk, block_size):
+def test_mxfp4_fused_sort_quant(dtype, token_num, E, topk, model_dim, block_size):
     """Fused sort+quant vs Opus sort + generic MXFP4 quant, plus its latency.
 
     Records the kernel latency and the byte-level quant/scale diffs; the sort
     layout, valid counts, and output zeroing are exact contracts and assert.
     """
-    hidden, topk_ids, topk_weights = _make_fused_inputs(token_num, E, topk)
+    hidden, topk_ids, topk_weights = _make_fused_inputs(token_num, E, topk, model_dim)
 
     ref_ids, ref_weights, ref_experts, ref_valid, _ = moe_sorting(
-        topk_ids, topk_weights, E, _FUSED_HIDDEN, dtypes.bf16, block_size
+        topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_size
     )
     ref_quant, _ = hip_fused_mxfp4_quant_moe_sort(
         hidden,
@@ -681,33 +688,147 @@ def test_mxfp4_fused_sort_quant(dtype, token_num, E, topk, block_size):
 
 def _check_fused_decode_sort_quant_wrapper():
     """`_fused_decode_sort_quant` returns sorted (default) and compact scales."""
-    for tokens in (2, 4):
-        hidden, topk_ids, topk_weights = _make_fused_inputs(tokens, 512, 10)
+    for (experts, topk, model_dim), tokens in itertools.product(_FUSED_ROUTES, (2, 4)):
+        hidden, topk_ids, topk_weights = _make_fused_inputs(
+            tokens, experts, topk, model_dim
+        )
         result = _fused_decode_sort_quant(
             hidden,
             topk_ids,
             topk_weights,
-            model_dim=_FUSED_HIDDEN,
-            global_experts=512,
+            model_dim=model_dim,
+            global_experts=experts,
             block_m=32,
             moebuf_dtype=torch.bfloat16,
             accumulate=True,
         )
         sorted_scale = result[-1]
         assert sorted_scale.shape[0] == result[0].shape[0]
-        assert sorted_scale.shape[1] == _FUSED_HIDDEN // 32
+        # H/32 scale columns are already a multiple of 8 for every instance.
+        assert sorted_scale.shape[1] == model_dim // 32
+        assert result[4].shape == (tokens, model_dim)
+        assert result[5].shape == (tokens, model_dim // 2)
         compact = _fused_decode_sort_quant(
             hidden,
             topk_ids,
             topk_weights,
-            model_dim=_FUSED_HIDDEN,
-            global_experts=512,
+            model_dim=model_dim,
+            global_experts=experts,
             block_m=32,
             moebuf_dtype=torch.bfloat16,
             accumulate=True,
             compact_scale=True,
         )
-        assert compact[-1].shape == (tokens, _FUSED_HIDDEN // 32)
+        assert compact[-1].shape == (tokens, model_dim // 32)
+
+
+def _unshuffle_sorted_scale(sorted_scale, rows):
+    """Invert `mx_scale_shuffle_idx`: tiled e8m0 bytes -> [rows, scaleN]."""
+    sm, sn = sorted_scale.shape
+    tiles = sorted_scale.view(torch.uint8).view(sm // 32, sn // 8, 4, 16, 2, 2)
+    return tiles.permute(0, 5, 3, 1, 4, 2).reshape(sm, sn)[:rows]
+
+
+def _per_route_scale_rows(sorted_scale, sorted_ids, num_valid_ids, tokens):
+    """Map each valid sorted row to (token, topk slot) -> its e8m0 bytes.
+
+    Row order inside an expert block differs between the Opus sort and the
+    fused kernel (atomic cursors), so rows are keyed by the route they carry.
+    Padding rows are skipped: neither path defines their scale bytes.
+    """
+    valid = int(num_valid_ids[0].item())
+    rows = _unshuffle_sorted_scale(sorted_scale, valid).cpu()
+    packed = sorted_ids[:valid].cpu().tolist()
+    by_route = {}
+    for row, value in enumerate(packed):
+        token = value & 0x00FFFFFF
+        if token < tokens:
+            by_route[(token, (value >> 24) & 0xFF)] = rows[row]
+    return by_route
+
+
+def _check_fused_matches_generic_path(
+    experts, topk, model_dim, tokens, zero_token=None
+):
+    """Byte-exact equality with the path the fused kernel replaces.
+
+    The generic path is Opus `moe_sorting` + `fused_dynamic_mxfp4_quant_moe_sort`
+    exactly as `fused_moe_2stages` calls it; the fused path is the kernel plus
+    the `mxfp4_moe_sort_fwd` scale expand, as `_fused_decode_sort_quant` runs it.
+    Compared: the fp4 a1 payload, every valid route's sorted+shuffled e8m0
+    scale row, and full zeroing of a poisoned `moe_buf`.
+
+    Two scale-byte cases are outside the bit-exact contract (the fp4 payload
+    is 0 in both, so the dequantized values agree):
+    - an all-zero 32-element group: the generic absMax floor is 1e-10, the
+      fused bf16 bit-max is 0, so the e8m0 bytes differ. `zero_token` zeroes
+      one token row (a CUDA-graph padded decode row) and its scale bytes are
+      skipped; every group with nonzero amax is still compared.
+    - a route with sorted weight 0: the generic kernel zeroes that row and its
+      scale, the fused kernel quantizes it. The inputs never produce one.
+    """
+    block_m = 32
+    hidden, topk_ids, topk_weights = _make_fused_inputs(
+        tokens, experts, topk, model_dim
+    )
+    if zero_token is not None:
+        hidden[zero_token].zero_()
+    group_live = hidden.view(tokens, -1, 32).abs().amax(dim=-1).ne(0).cpu()
+    ref_ids, ref_weights, _ref_experts, ref_valid, _ = moe_sorting(
+        topk_ids, topk_weights, experts, model_dim, dtypes.bf16, block_m
+    )
+    ref_a1, ref_scale = hip_fused_mxfp4_quant_moe_sort(
+        hidden,
+        sorted_ids=ref_ids,
+        num_valid_ids=ref_valid,
+        token_num=tokens,
+        topk=topk,
+        block_size=block_m,
+        sorted_weights=ref_weights,
+        num_experts_upper_bound=experts,
+    )
+
+    poisoned_buf = torch.full(
+        (tokens, model_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    f_ids, _f_weights, _f_experts, f_valid, _f_buf, f_a1, f_scale_token = _run_fused(
+        hidden, topk_ids, topk_weights, experts, block_m, poisoned_buf
+    )
+    assert torch.equal(
+        poisoned_buf.view(torch.int16), torch.zeros_like(poisoned_buf.view(torch.int16))
+    ), (experts, topk, model_dim, tokens, "moe_buf not fully zeroed")
+    f_scale = mxfp4_moe_sort_fwd(
+        f_scale_token,
+        sorted_ids=f_ids,
+        num_valid_ids=f_valid,
+        token_num=tokens,
+        cols=model_dim,
+    )
+    torch.cuda.synchronize()
+
+    assert f_scale.shape[1] == ref_scale.shape[1] == model_dim // 32
+    assert torch.equal(f_valid, ref_valid), (experts, topk, model_dim, tokens)
+    assert torch.equal(f_a1.view(torch.uint8), ref_a1.view(torch.uint8)), (
+        experts,
+        topk,
+        model_dim,
+        tokens,
+        "fp4 a1 payload differs",
+    )
+    ref_rows = _per_route_scale_rows(ref_scale, ref_ids, ref_valid, tokens)
+    fused_rows = _per_route_scale_rows(f_scale, f_ids, f_valid, tokens)
+    assert ref_rows.keys() == fused_rows.keys()
+    assert len(ref_rows) == tokens * topk
+    for route, ref_row in ref_rows.items():
+        live = group_live[route[0]]
+        assert torch.equal(ref_row[live], fused_rows[route][live]), (
+            experts,
+            topk,
+            model_dim,
+            tokens,
+            route,
+            "sorted e8m0 scale row differs",
+        )
 
 
 def _check_fused_gate():
@@ -717,13 +838,18 @@ def _check_fused_gate():
     reaching the op is fatal -- this gate is the only guard.
     """
     table = [
-        (512, 10, 100, True),  # non power-of-2 M accepted
-        (513, 11, 8, True),  # fused-shared route accepted
-        (512, 8, 8, False),  # uninstantiated topk
-        (256, 10, 8, False),  # uninstantiated experts
-        (512, 10, 129, False),  # M above kernel contract
+        (512, 10, 4096, 100, True),  # non power-of-2 M accepted
+        (513, 11, 4096, 8, True),  # fused-shared route accepted
+        (513, 11, 2560, 16, True),  # Qwen3.8 MTP-draft decode
+        (513, 11, 2560, 64, True),  # Qwen3.8 target-verify decode
+        (512, 8, 4096, 8, False),  # uninstantiated topk
+        (256, 10, 4096, 8, False),  # uninstantiated experts
+        (512, 10, 2560, 8, False),  # uninstantiated (E, topk) at H=2560
+        (513, 11, 3072, 8, False),  # uninstantiated hidden size
+        (512, 10, 4096, 129, False),  # M above kernel contract
+        (513, 11, 2560, 129, False),  # M above kernel contract
     ]
-    for experts, topk, tokens, expected in table:
+    for experts, topk, model_dim, tokens, expected in table:
         pool = min(experts, 512)
         topk_ids = torch.stack(
             [
@@ -732,9 +858,7 @@ def _check_fused_gate():
             ]
         )
         topk_weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
-        hidden = torch.randn(
-            (tokens, _FUSED_HIDDEN), dtype=torch.bfloat16, device="cuda"
-        )
+        hidden = torch.randn((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
         assert (
             _is_fused_decode_sort_quant_enabled(
                 hidden,
@@ -744,12 +868,12 @@ def _check_fused_gate():
                 **_FUSED_GATE_KWARGS,
             )
             is expected
-        ), (experts, topk, tokens)
+        ), (experts, topk, model_dim, tokens)
 
 
 def _check_fused_gate_uses_runtime_arch():
     """Runtime dispatch must ignore a potentially different build target."""
-    hidden, topk_ids, topk_weights = _make_fused_inputs(8, 512, 10)
+    hidden, topk_ids, topk_weights = _make_fused_inputs(8, 512, 10, 4096)
     original = fused_moe.get_gfx_runtime
     for arch in ("gfx942", None):
 
@@ -773,7 +897,7 @@ def _check_fused_gate_uses_runtime_arch():
 
 def _check_fused_disable_toggle():
     """The internal base-vs-head hook forces the generic path when set."""
-    hidden, topk_ids, topk_weights = _make_fused_inputs(8, 512, 10)
+    hidden, topk_ids, topk_weights = _make_fused_inputs(8, 512, 10, 4096)
     assert _is_fused_decode_sort_quant_enabled(
         hidden, topk_ids, topk_weights, global_experts=512, **_FUSED_GATE_KWARGS
     )
@@ -786,8 +910,8 @@ def _check_fused_disable_toggle():
         fused_moe._fused_decode_sort_quant_disabled = False
 
 
-def _check_fused_cuda_graph_replay_safe(experts, topk, block_size):
-    hidden, topk_ids, topk_weights = _make_fused_inputs(4, experts, topk)
+def _check_fused_cuda_graph_replay_safe(experts, topk, model_dim, block_size):
+    hidden, topk_ids, topk_weights = _make_fused_inputs(4, experts, topk, model_dim)
     # Compile/warm up before capture: the graph only records the fixed-address
     # launch; every buffer is preallocated.
     _run_fused(hidden, topk_ids, topk_weights, experts, block_size)
@@ -809,14 +933,22 @@ if _running_on_gfx950():
     _check_fused_gate_uses_runtime_arch()
     _check_fused_disable_toggle()
     _check_fused_decode_sort_quant_wrapper()
+    for (E, topk, model_dim), m in itertools.product(
+        _FUSED_ROUTES, _FUSED_EXACT_TOKEN_COUNTS
+    ):
+        _check_fused_matches_generic_path(E, topk, model_dim, m)
+    for E, topk, model_dim in _FUSED_ROUTES:
+        _check_fused_matches_generic_path(E, topk, model_dim, 16, zero_token=3)
 
     df = []
     for dtype in args.dtype:
-        for (E, topk), m in itertools.product(_FUSED_ROUTES, _FUSED_TOKEN_COUNTS):
-            df.append(test_mxfp4_fused_sort_quant(dtype, m, E, topk, 32))
+        for (E, topk, model_dim), m in itertools.product(
+            _FUSED_ROUTES, _FUSED_TOKEN_COUNTS
+        ):
+            df.append(test_mxfp4_fused_sort_quant(dtype, m, E, topk, model_dim, 32))
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("mxfp4_fused_sort_quant summary (markdown):\n%s", df_md)
 
-    for E, topk in _FUSED_ROUTES:
-        _check_fused_cuda_graph_replay_safe(E, topk, 32)
+    for E, topk, model_dim in _FUSED_ROUTES:
+        _check_fused_cuda_graph_replay_safe(E, topk, model_dim, 32)

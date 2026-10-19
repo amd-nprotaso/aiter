@@ -109,9 +109,13 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-# (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
-# sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
-_FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
+# (num_experts, topk, hidden) shapes the HIP kernel is instantiated for; must
+# stay in sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
+_FUSED_DECODE_SORT_QUANT_ROUTES = {
+    (512, 10, 4096),
+    (513, 11, 4096),
+    (513, 11, 2560),
+}
 _FUSED_DECODE_SORT_QUANT_MAX_M = 128
 
 # Internal benchmark/test hook (not a public switch): set True to force the
@@ -143,10 +147,10 @@ def _is_fused_decode_sort_quant_enabled(
 ) -> bool:
     """Gate the direct-scale HIP route-sort/quant kernel to supported decode.
 
-    The shape bounds mirror the kernel's own contract (``model_dim=4096``,
-    ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
-    route). The remaining conditions are integration requirements: they
-    describe the stage-1 path whose activation quantization this kernel
+    The shape bounds mirror the kernel's own contract (``block_m=32``,
+    ``M`` in ``[1, 128]``, an instantiated ``(E, topk, model_dim)`` route).
+    The remaining conditions are integration requirements: they describe
+    the stage-1 path whose activation quantization this kernel
     replaces. The fused path is selected automatically whenever every
     condition matches; it falls back to the generic sort + quant otherwise.
     """
@@ -158,14 +162,14 @@ def _is_fused_decode_sort_quant_enabled(
         return False
     tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
     topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    hidden = hidden_states.shape[1] if hidden_states.ndim == 2 else 0
     return (
         runtime_is_gfx950
         and hidden_states.dtype == dtypes.bf16
         and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
-        and hidden_states.shape[1] == 4096
         and hidden_states.is_contiguous()
         and topk_ids.dtype == dtypes.i32
-        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and (global_experts, topk, hidden) in _FUSED_DECODE_SORT_QUANT_ROUTES
         and topk_ids.shape[0] == tokens
         and topk_ids.is_contiguous()
         and topk_weights.dtype == dtypes.fp32
