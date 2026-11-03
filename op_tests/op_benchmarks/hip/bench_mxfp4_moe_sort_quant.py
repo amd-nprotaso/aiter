@@ -15,12 +15,18 @@ conventional two-launch sequence against the fused kernel:
 Each variant is CUDA-graph captured and replayed, so the numbers are launch
 cost inclusive and free of Python overhead.
 
-Default shape is the Qwen3.5 MXFP4 MoE decode config: model_dim=4096, with the
-two instantiated routes (num_experts, topk) in {(512, 10), (513, 11)}.
+By default every instantiated (num_experts, topk, model_dim) shape is swept:
+the Qwen3.5 MXFP4 MoE decode config (model_dim=4096, (512, 10) and (513, 11))
+and Qwen3.8-Flash-Next (model_dim=2560, (513, 11) with the shared expert fused
+as expert 512). --routes / --model-dim narrow the sweep; combinations the
+kernel is not instantiated for are skipped.
 
 Usage:
-    # Run with default parameters (Qwen3.5 decode shape)
+    # Run every instantiated shape
     python bench_mxfp4_moe_sort_quant.py
+
+    # Qwen3.8-Flash-Next decode: MTP draft (M=16) and target verify (M=64)
+    python bench_mxfp4_moe_sort_quant.py --routes 513,11 --model-dim 2560 -t 16 64
 
     # Run a single route variant at selected token counts
     python bench_mxfp4_moe_sort_quant.py --routes 512,10 -t 1 8 32
@@ -39,6 +45,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import (
+    _FUSED_DECODE_SORT_QUANT_ROUTES,
     _USE_CK_MOE_SORTING,
     _USE_FLYDSL_MOE_SORTING,
     moe_sorting,
@@ -47,11 +54,8 @@ from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_f
 
 DEVICE = "cuda"
 
-# Default sweep parameters (Qwen3.5 397B MXFP4 MoE decode shard)
-MODEL_DIM = 4096
 BLOCK_M = 32
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
-ROUTES = [(512, 10), (513, 11)]
 # The last expert of this route is a fused shared expert every token is routed
 # to; the other route dispatches its shared expert separately.
 FUSED_SHARED_ROUTE = (513, 11)
@@ -122,7 +126,7 @@ def bench_sort_quant_latency(
     tokens: int,
     experts: int,
     topk: int,
-    model_dim: int = MODEL_DIM,
+    model_dim: int,
     block_m: int = BLOCK_M,
     iters: int = 300,
     warmup: int = 30,
@@ -152,6 +156,8 @@ def bench_sort_quant_latency(
             topk=topk,
             block_size=block_m,
             sorted_weights=weights,
+            # fused_moe_2stages bounds the quant grid by the routed expert count.
+            num_experts_upper_bound=experts,
         )
 
     # Output buffers for the fused kernel, laid out as aiter.fused_moe allocates them.
@@ -210,15 +216,48 @@ def bench_sort_quant_latency(
     )
 
 
+def select_shapes(routes, model_dims) -> list[tuple[int, int, int]]:
+    """Instantiated (experts, topk, model_dim) shapes matching the filters.
+
+    The default sweep is every shape in _FUSED_DECODE_SORT_QUANT_ROUTES: the
+    Qwen3.5 397B (H=4096) and Qwen3.8-Flash-Next (H=2560) MXFP4 MoE decode
+    shards. ``None`` leaves a filter open; requested combinations the kernel is not
+    instantiated for are reported and skipped (the op would abort on them).
+    """
+    instantiated = sorted(_FUSED_DECODE_SORT_QUANT_ROUTES, key=lambda s: (-s[2], s))
+    if routes is None:
+        routes = list(dict.fromkeys((e, k) for e, k, _ in instantiated))
+    shapes = []
+    for experts, topk in routes:
+        dims = model_dims or [
+            h for e, k, h in instantiated if (e, k) == (experts, topk)
+        ]
+        if not dims:
+            print(
+                f"skip E={experts} topk={topk}: "
+                "no instantiated fused sort+quant shape"
+            )
+            continue
+        for model_dim in dims:
+            if (experts, topk, model_dim) in _FUSED_DECODE_SORT_QUANT_ROUTES:
+                shapes.append((experts, topk, model_dim))
+            else:
+                print(
+                    f"skip E={experts} topk={topk} model_dim={model_dim}: "
+                    "not an instantiated fused sort+quant shape"
+                )
+    return shapes
+
+
 def run_benchmark(args):
-    """Run the plumbing benchmark across every route variant and token count."""
+    """Run the plumbing benchmark across every selected shape and token count."""
     print(f"arch: {torch.cuda.get_device_properties(0).gcnArchName}")
     print(f"flydsl_sorting={_USE_FLYDSL_MOE_SORTING} ck_sorting={_USE_CK_MOE_SORTING}")
 
     results = []
-    for experts, topk in args.routes:
+    for experts, topk, model_dim in select_shapes(args.routes, args.model_dim):
         print(
-            f"\n=== E={experts} topk={topk} model_dim={args.model_dim} "
+            f"\n=== E={experts} topk={topk} model_dim={model_dim} "
             f"block_m={args.block_m} (us) ==="
         )
         header = (
@@ -233,13 +272,15 @@ def run_benchmark(args):
                 tokens,
                 experts,
                 topk,
-                model_dim=args.model_dim,
+                model_dim=model_dim,
                 block_m=args.block_m,
                 iters=args.iters,
                 warmup=args.warmup,
                 reps=args.reps,
             )
-            results.append((experts, topk, tokens, sort_us, base_us, fused_us, ss_us))
+            results.append(
+                (experts, topk, model_dim, tokens, sort_us, base_us, fused_us, ss_us)
+            )
             print(
                 f"{tokens:>8} {sort_us:>10.2f} {base_us:>12.2f} {fused_us:>10.2f} "
                 f"{ss_us:>10.2f} {base_us / fused_us:>7.2f}x "
@@ -255,14 +296,23 @@ def _save_results_csv(filepath: str, results: list):
     path = Path(filepath)
     with open(path, "w") as f:
         f.write(
-            "experts,topk,tokens,sort_us,baseline_sort_quant_us,fused_us,"
+            "experts,topk,model_dim,tokens,sort_us,baseline_sort_quant_us,fused_us,"
             "fused_sorted_scale_us,speedup_fused,speedup_fused_sorted_scale\n"
         )
         f.writelines(
-            f"{experts},{topk},{tokens},{sort_us:.4f},{base_us:.4f},"
+            f"{experts},{topk},{model_dim},{tokens},{sort_us:.4f},{base_us:.4f},"
             f"{fused_us:.4f},{ss_us:.4f},"
             f"{base_us / fused_us:.4f},{base_us / ss_us:.4f}\n"
-            for experts, topk, tokens, sort_us, base_us, fused_us, ss_us in results
+            for (
+                experts,
+                topk,
+                model_dim,
+                tokens,
+                sort_us,
+                base_us,
+                fused_us,
+                ss_us,
+            ) in results
         )
     print(f"\nResults saved to {path.resolve()}")
 
@@ -294,15 +344,17 @@ def parse_args():
         type=_route,
         nargs="+",
         metavar="E,TOPK",
-        default=ROUTES,
-        help="Route variants as comma-separated expert/topk pairs.",
+        default=None,
+        help="Route variants as comma-separated expert/topk pairs "
+        "(default: every instantiated route).",
     )
     parser.add_argument(
         "--model-dim",
         type=int,
+        nargs="+",
         dest="model_dim",
-        default=MODEL_DIM,
-        help="Model hidden dimension.",
+        default=None,
+        help="Model hidden dimensions (default: every instantiated one per route).",
     )
     parser.add_argument(
         "--block-m",
